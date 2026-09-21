@@ -1,171 +1,767 @@
-About
-=====
-`ngx_cache_purge` is `nginx` module which adds ability to purge content from
-`FastCGI`, `proxy`, `SCGI` and `uWSGI` caches.
+# ngx_cache_purge
+
+An nginx module that adds cache purge support for `FastCGI`, `proxy`, `SCGI`,
+and `uWSGI` caches. A purge operation removes the cached entry whose key
+matches the purge request.
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Compatibility](#compatibility)
+- [Installation](#installation)
+- [Directives](#directives)
+- [Job API (async purge tracking)](#job-api-async-purge-tracking)
+- [Partial key purge](#partial-key-purge)
+- [Sample configurations](#sample-configurations)
+- [Performance tuning](#performance-tuning)
+- [Monitoring and debugging](#monitoring-and-debugging)
+- [Troubleshooting](#troubleshooting)
+- [Testing](#testing)
+- [Migration](#migration)
+- [Security](#security)
+- [License](#license)
+
+---
+
+## Features
+
+- **Inline purge** — dedicated HTTP method (`PURGE`) with IP access control
+- **Separate purge location** — 3-arg `proxy_cache_purge zone key` syntax for
+  regex-captured key purging without a `proxy_pass`
+- **Wildcard / partial purge** — trailing `*` walks the cache directory and
+  removes all matching entries
+- **`purge_all`** — removes every entry in the cache zone in one request
+- **Background queue** — async purge processing with configurable batch size
+  and throttling so purge I/O does not block worker event loops
+- **Vary-aware purge** — after an exact-key purge, removes all filesystem
+  variants (gzip, Vary header) sharing the same cache key
+- **Response types** — `html` (default), `json`, `xml`, `text`
+- **Job API** — ULID job id per purge, `queued → processing →
+  completed / failed` tracking in shared memory, `GET /purge/status/<id>`
+  and `GET /purge/jobs` query APIs, TTL expiry
+
+---
+
+## Compatibility
+
+| nginx  | status     |
+|--------|------------|
+| 1.20.x | ✓ tested   |
+| 1.26.x | ✓ tested   |
+| 1.28.x | ✓ tested   |
+| 1.29.x | ✓ tested   |
+
+Older releases back to 1.7.9 compile but are not covered by CI.
+
+---
+
+## Installation
+
+```bash
+cd /path/to/nginx-source
+./configure --add-module=/path/to/ngx_cache_purge
+make
+make install
+```
+
+Dynamic module:
+
+```bash
+./configure --add-dynamic-module=/path/to/ngx_cache_purge
+make modules
+```
+
+---
+
+## Directives
+
+### `proxy_cache_purge`
+
+```
+Syntax:  proxy_cache_purge on | off | <method> [purge_all] from all | <cidr> ...
+         proxy_cache_purge <zone> "<key_expression>"
+Default: —
+Context: http, server, location
+```
+
+**Inline form** (`from …`) — intercepts the named HTTP method on a proxy
+location and purges the matching cache entry. `on` is a shorthand for method
+`PURGE`; `off` disables purging. Optionally restrict to a list of CIDR ranges
+or use `from all` to allow from any address. Adding `purge_all` before `from`
+empties the entire cache zone regardless of the request URI.
+
+**Separate-location form** (two arguments) — use inside a dedicated purge
+location (typically a regex location capturing the cache key). Looks up the
+cache zone by name and purges the compiled key expression. This form is
+incompatible with `proxy_cache` and `proxy_pass` in the same location.
 
 
-Sponsors
-========
-Work on the original patch was fully funded by [yo.se](http://yo.se).
+### `fastcgi_cache_purge`
+
+```
+Syntax:  fastcgi_cache_purge on | off | <method> [purge_all] from all | <cidr> ...
+         fastcgi_cache_purge <zone> "<key_expression>"
+Default: —
+Context: http, server, location
+```
+
+Equivalent to `proxy_cache_purge` but for FastCGI cache zones configured with
+`fastcgi_cache` / `fastcgi_cache_path`.
 
 
-Status
-======
-This module is production-ready.
+### `scgi_cache_purge`
+
+```
+Syntax:  scgi_cache_purge on | off | <method> [purge_all] from all | <cidr> ...
+         scgi_cache_purge <zone> "<key_expression>"
+Default: —
+Context: http, server, location
+```
+
+Equivalent to `proxy_cache_purge` but for SCGI cache zones configured with
+`scgi_cache` / `scgi_cache_path`.
 
 
-Configuration directives (same location syntax)
-===============================================
-fastcgi_cache_purge
--------------------
-* **syntax**: `fastcgi_cache_purge on|off|<method> [from all|<ip> [.. <ip>]]`
-* **default**: `none`
-* **context**: `http`, `server`, `location`
+### `uwsgi_cache_purge`
 
-Allow purging of selected pages from `FastCGI`'s cache.
+```
+Syntax:  uwsgi_cache_purge on | off | <method> [purge_all] from all | <cidr> ...
+         uwsgi_cache_purge <zone> "<key_expression>"
+Default: —
+Context: http, server, location
+```
 
-
-proxy_cache_purge
------------------
-* **syntax**: `proxy_cache_purge on|off|<method> [from all|<ip> [.. <ip>]]`
-* **default**: `none`
-* **context**: `http`, `server`, `location`
-
-Allow purging of selected pages from `proxy`'s cache.
+Equivalent to `proxy_cache_purge` but for uWSGI cache zones configured with
+`uwsgi_cache` / `uwsgi_cache_path`.
 
 
-scgi_cache_purge
-----------------
-* **syntax**: `scgi_cache_purge on|off|<method> [from all|<ip> [.. <ip>]]`
-* **default**: `none`
-* **context**: `http`, `server`, `location`
+### `cache_purge_response_type`
 
-Allow purging of selected pages from `SCGI`'s cache.
+```
+Syntax:  cache_purge_response_type html | json | xml | text
+Default: html
+Context: http, server, location
+```
 
-
-uwsgi_cache_purge
------------------
-* **syntax**: `uwsgi_cache_purge on|off|<method> [from all|<ip> [.. <ip>]]`
-* **default**: `none`
-* **context**: `http`, `server`, `location`
-
-Allow purging of selected pages from `uWSGI`'s cache.
+Sets the `Content-Type` and body format of purge responses. Has no effect on
+cache-miss responses (412 / 404), which are generated by nginx's built-in
+error-page renderer.
 
 
-Configuration directives (separate location syntax)
-===================================================
-fastcgi_cache_purge
--------------------
-* **syntax**: `fastcgi_cache_purge zone_name key`
-* **default**: `none`
-* **context**: `location`
+### `cache_purge_background_queue`
 
-Sets area and key used for purging selected pages from `FastCGI`'s cache.
+```
+Syntax:  cache_purge_background_queue on | off
+Default: off
+Context: http
+```
 
-
-proxy_cache_purge
------------------
-* **syntax**: `proxy_cache_purge zone_name key`
-* **default**: `none`
-* **context**: `location`
-
-Sets area and key used for purging selected pages from `proxy`'s cache.
+When enabled, wildcard and `purge_all` purge requests are enqueued and return
+`202 Accepted` immediately; a per-worker background timer drains the queue in
+batches. Has no effect on exact-key purges, which are always synchronous. When
+disabled, all purges are processed synchronously in the request handler.
 
 
-scgi_cache_purge
-----------------
-* **syntax**: `scgi_cache_purge zone_name key`
-* **default**: `none`
-* **context**: `location`
+### `cache_purge_queue_size`
 
-Sets area and key used for purging selected pages from `SCGI`'s cache.
+```
+Syntax:  cache_purge_queue_size <number>
+Default: 1024
+Context: http
+```
 
-
-uwsgi_cache_purge
------------------
-* **syntax**: `uwsgi_cache_purge zone_name key`
-* **default**: `none`
-* **context**: `location`
-
-Sets area and key used for purging selected pages from `uWSGI`'s cache.
+Maximum number of entries the background queue can hold. Each slot occupies
+roughly 1–2 KB of shared memory (2048 slots ≈ 3 MB). When the queue is full,
+new wildcard / `purge_all` purge requests fall back to synchronous processing.
+Only meaningful when `cache_purge_background_queue on`.
 
 
-Sample configuration (same location syntax)
-===========================================
-    http {
-        proxy_cache_path  /tmp/cache  keys_zone=tmpcache:10m;
+### `cache_purge_batch_size`
 
-        server {
-            location / {
-                proxy_pass         http://127.0.0.1:8000;
-                proxy_cache        tmpcache;
-                proxy_cache_key    $uri$is_args$args;
-                proxy_cache_purge  PURGE from 127.0.0.1;
-            }
+```
+Syntax:  cache_purge_batch_size <number>
+Default: 10
+Max:     64
+Context: http
+```
+
+Number of queue entries processed per background timer tick. Values above 64
+are clamped to 64 at startup (a warning is logged). Reduce this value if purge
+operations cause iowait spikes; increase it for faster queue drain on fast
+storage. Only meaningful when `cache_purge_background_queue on`.
+
+
+### `cache_purge_throttle_ms`
+
+```
+Syntax:  cache_purge_throttle_ms <time>
+Default: 10ms
+Context: http
+```
+
+Interval between background processing ticks. Accepts any nginx time value:
+`10ms`, `500ms`, `1s`, `2s 500ms`. Only meaningful when
+`cache_purge_background_queue on`.
+
+Increase on constrained or spinning-disk storage; decrease on NVMe.
+
+**Time-unit note:** a bare integer with no suffix (e.g. `10`) is interpreted
+as milliseconds — matching the `_ms` directive name — and a startup warning is
+logged. Use an explicit `ms` suffix (`10ms`) to silence the warning. This
+differs from most nginx time directives, where a bare integer means seconds.
+
+
+### `cache_purge_legacy_status`
+
+```
+Syntax:  cache_purge_legacy_status on | off
+Default: on
+Context: http
+```
+
+Controls the HTTP status code returned when a purge request targets an entry
+that is not in the cache:
+
+| value | status on miss            |
+|-------|---------------------------|
+| `on`  | `412 Precondition Failed` |
+| `off` | `404 Not Found`           |
+
+Default is `on` (412) for backwards compatibility with earlier releases.
+Set to `off` to return `404 Not Found`, the correct HTTP status for a
+resource that does not exist (RFC 9110 §15.5.5).
+
+
+### `cache_purge_vary_aware`
+
+```
+Syntax:  cache_purge_vary_aware on | off
+Default: off
+Context: http
+```
+
+When `on`, an exact-key purge walks the cache directory after deleting the
+primary file and removes any remaining files that carry the same `KEY:` string.
+This covers all `Vary` and `gzip_vary` variants of a cached response, which
+are stored at different filesystem paths but share one logical key. The byte
+immediately after the key string in each file is verified to be `\n`,
+preventing false matches against keys that share only a common prefix.
+
+Disabled by default because it adds a full cache directory walk per exact-key
+purge. Enable it when `gzip_vary on` or `Vary:` headers cause multiple cache
+files to be created for a single logical entry. Wildcard and `purge_all`
+purges do not need this option — the walk they already perform catches every
+variant regardless.
+
+
+### `cache_purge_job_store`
+
+```
+Syntax:  cache_purge_job_store zone=<name>:<size> [max_jobs=<number>] [ttl=<time>]
+Default: — (disabled; no jobs are created)
+Context: http
+```
+
+Enables the Job API. Jobs are kept in a shared-memory zone (`ngx_slab_pool_t`
++ `ngx_rbtree_t` + `ngx_shmtx_t`), so the worker that creates a job, the
+worker that executes it, and the worker that answers a status query may all
+be different.
+
+- `zone` (required) — shm zone name and size, e.g. `zone=cache_purge_jobs:20m`.
+  Missing `zone=` fails `nginx -t`.
+- `max_jobs` (default `10000`) — cap on stored jobs. When full, the oldest
+  expired `completed` / `failed` jobs are reclaimed first (pressure cleanup).
+  Must be non-zero.
+- `ttl` (default `24h`) — retention for terminal (`completed` / `failed`)
+  jobs. Accepts any nginx time value (`8s`, `1h`, `24h`). Parsed as
+  milliseconds internally, stored as seconds. `queued` / `processing` jobs
+  are never silently reaped by TTL. Must be non-zero.
+
+Without this directive: no jobs are created, no job shm is allocated, purge
+responses and behaviour are unchanged (fully backwards compatible).
+
+
+### `cache_purge_job_status`
+
+```
+Syntax:  cache_purge_job_status
+Default: —
+Context: location
+```
+
+Binds the current location as a job-status endpoint. The job id is taken
+from the last 26 characters of the request URI, so mount it on a prefix
+such as `/purge/status/`:
+
+```nginx
+location /purge/status/ {
+    cache_purge_job_status;
+}
+```
+
+Only `GET` is allowed (`405` otherwise). Unknown / expired ids return `404`
+with `{"error":{"code":"JOB_NOT_FOUND",...}}`. Protect with `allow` / `deny`
+or an auth check — never expose unauthenticated.
+
+
+### `cache_purge_job_list`
+
+```
+Syntax:  cache_purge_job_list
+Default: —
+Context: location
+```
+
+Binds the current location as a job-list endpoint:
+
+```nginx
+location = /purge/jobs {
+    cache_purge_job_list;
+}
+```
+
+Only `GET` is allowed. Query filters: `status=queued|processing|completed|
+failed`, `type=url|directory|all`, `limit=<1..100>` (default `20`).
+Expired terminal jobs are hidden (lazy expiry).
+
+---
+
+## Job API (async purge tracking)
+
+Every `PURGE` request creates a job (ULID, 26 chars, e.g.
+`01K5X8Q7M4K7Y4H6NQ9P3R2ABC`) when `cache_purge_job_store` is configured:
+
+```
+queued → processing → completed / failed
+```
+
+- exact-key purge: synchronous — `processing` → `completed` / `failed`
+  inside the request, HTTP `200` (or existing miss semantics).
+- when a Job ID is attached to a purge response, the module automatically
+  returns the Job API JSON format (`application/json`) even if the historical
+  `cache_purge_response_type` default is `html`; this prevents Job metadata
+  from being hidden by the legacy HTML response. Requests without a Job ID
+  keep the configured response type unchanged.
+- wildcard / `purge_all`: `queued` + HTTP `202 Accepted` with a `Location:
+  /purge/status/<job_id>` header; the background queue worker flips the job
+  to `processing` on dequeue and to `completed` / `failed` only after the
+  real purge code finishes. `202` never means `completed`.
+- `completed` is set exclusively by the purge execution path (including all
+  Vary-aware variant deletions); it is never inferred from HIT/MISS, sleep,
+  or file polling.
+
+### nginx.conf — full example
+
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx levels=1:2
+                     keys_zone=main:10m max_size=5g inactive=7d
+                     use_temp_path=off;
+
+    cache_purge_response_type json;
+
+    cache_purge_background_queue on;
+    cache_purge_queue_size       2048;
+    cache_purge_batch_size       20;
+    cache_purge_throttle_ms      10ms;
+
+    cache_purge_vary_aware on;
+
+    # Job store: 20 MB shm, max 10000 jobs, 24h retention for
+    # completed/failed jobs.
+    cache_purge_job_store zone=cache_purge_jobs:20m max_jobs=10000 ttl=24h;
+
+    server {
+        listen 80;
+
+        location / {
+            proxy_pass      http://backend;
+            proxy_cache     main;
+            proxy_cache_key "$host$uri$is_args$args";
+            proxy_cache_purge PURGE from 127.0.0.1;
+        }
+
+        # IMPORTANT: status/list locations must be declared BEFORE any
+        # generic /purge/ regex location, otherwise the generic location
+        # shadows them.
+        location /purge/status/ {
+            allow 127.0.0.1;
+            deny  all;
+            cache_purge_job_status;
+        }
+
+        location = /purge/jobs {
+            allow 127.0.0.1;
+            deny  all;
+            cache_purge_job_list;
         }
     }
+}
+```
 
+Equivalent directives exist for `fastcgi_cache_purge`, `scgi_cache_purge`,
+`uwsgi_cache_purge`. The same three job directives cover all of them.
 
-Sample configuration (separate location syntax)
-===============================================
-    http {
-        proxy_cache_path  /tmp/cache  keys_zone=tmpcache:10m;
+### Interface usage
 
-        server {
-            location / {
-                proxy_pass         http://127.0.0.1:8000;
-                proxy_cache        tmpcache;
-                proxy_cache_key    $uri$is_args$args;
-            }
+Purge (exact key, synchronous):
 
-            location ~ /purge(/.*) {
-                allow              127.0.0.1;
-                deny               all;
-                proxy_cache_purge  tmpcache $1$is_args$args;
-            }
+```bash
+curl -i -X PURGE http://localhost/images/logo.png
+# HTTP/1.1 200 OK
+# Content-Type: application/json
+# {"job_id":"01K5X8Q7...","status":"completed","type":"url",
+#  "key":"...","files_deleted":1}
+```
+
+Purge (wildcard, async — requires `cache_purge_background_queue on`):
+
+```bash
+curl -i -X PURGE 'http://localhost/statics/js/*'
+# HTTP/1.1 202 Accepted
+# Location: /purge/status/01K5X8Q7M4K7Y4H6NQ9P3R2ABC
+# {"job_id":"01K5X8Q7M4K7Y4H6NQ9P3R2ABC","status":"queued",
+#  "type":"directory","key":"...js*"}
+```
+
+Query one job:
+
+```bash
+curl http://localhost/purge/status/01K5X8Q7M4K7Y4H6NQ9P3R2ABC
+# {"job_id":"...","status":"processing","type":"directory",
+#  "zone":"main","key":"...js*",
+#  "created_at":1726800010,"started_at":1726800010,"completed_at":0,
+#  "duration_ms":2147,"files_deleted":812}
+
+curl http://localhost/purge/status/AAAAAAAAAAAAAAAAAAAAAAAAAA
+# HTTP/1.1 404 Not Found
+# {"error":{"code":"JOB_NOT_FOUND",
+#  "message":"purge job not found or expired"}}
+```
+
+List jobs:
+
+```bash
+curl 'http://localhost/purge/jobs'
+curl 'http://localhost/purge/jobs?status=processing'
+curl 'http://localhost/purge/jobs?type=directory'
+curl 'http://localhost/purge/jobs?limit=20'
+# {"jobs":[{"job_id":"01K...","status":"completed","type":"directory",
+#   "created_at":...}],"total":1}
+```
+
+`limit` defaults to `20` and is capped at `100`. Expired `completed` /
+`failed` jobs (older than `ttl`) disappear from `list` and return `404`
+from `status`. `nginx -s reload` preserves the job shm zone; a full
+restart drops it (old ids → `404`, by design — the store is runtime
+state, not an audit DB).
+
+---
+
+## Partial key purge
+
+When the exact cache key is not known — for example because it includes cookie
+values or query parameters — append `*` to the key to request a prefix match:
+
+```
+PURGE /images/header*
+```
+
+The `*` must be the last character of the URI. Ensure `$uri` appears at the
+**end** of `proxy_cache_key` when using this feature, otherwise the prefix
+match will not align with the stored key.
+
+---
+
+## Sample configurations
+
+### Basic — inline purge method
+
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=main:10m;
+
+    server {
+        location / {
+            proxy_pass        http://backend;
+            proxy_cache       main;
+            proxy_cache_key   "$host$uri$is_args$args";
+            proxy_cache_purge PURGE from 127.0.0.1;
         }
     }
+}
+```
 
+```bash
+curl -X PURGE http://localhost/images/logo.png
+# 200 — entry purged
+# 412 — entry not in cache  (or 404 with cache_purge_legacy_status off)
+# 403 — client IP not in the allowed list
+```
 
-Testing
-=======
-`ngx_cache_purge` comes with complete test suite based on [Test::Nginx](http://github.com/agentzh/test-nginx).
+### Basic — separate purge location
 
-You can test it by running:
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=main:10m;
 
-`$ prove`
+    server {
+        location / {
+            proxy_pass      http://backend;
+            proxy_cache     main;
+            proxy_cache_key "$host$uri$is_args$args";
+        }
 
+        # Capture the cache key from the URI and pass it to the 3-arg form.
+        # No proxy_pass or proxy_cache required in this location.
+        location ~ ^/purge(/.*) {
+            allow             127.0.0.1;
+            deny              all;
+            proxy_cache_purge main "$host$1$is_args$args";
+        }
+    }
+}
+```
 
-License
-=======
-    Copyright (c) 2009-2014, FRiCKLE <info@frickle.com>
-    Copyright (c) 2009-2014, Piotr Sikora <piotr.sikora@frickle.com>
-    All rights reserved.
+### Background queue enabled
 
-    This project was fully funded by yo.se.
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=main:10m;
 
-    Redistribution and use in source and binary forms, with or without
-    modification, are permitted provided that the following conditions
-    are met:
-    1. Redistributions of source code must retain the above copyright
-       notice, this list of conditions and the following disclaimer.
-    2. Redistributions in binary form must reproduce the above copyright
-       notice, this list of conditions and the following disclaimer in the
-       documentation and/or other materials provided with the distribution.
+    cache_purge_background_queue on;
+    cache_purge_queue_size        2048;
+    cache_purge_batch_size        20;
+    cache_purge_throttle_ms       10ms;
 
-    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-    HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+    server {
+        location / {
+            proxy_pass        http://backend;
+            proxy_cache       main;
+            proxy_cache_key   "$host$uri$is_args$args";
+            proxy_cache_purge PURGE from 127.0.0.1;
+        }
+    }
+}
+```
 
+### Purge all entries
 
-See also
-========
-- [ngx_slowfs_cache](http://github.com/FRiCKLE/ngx_slowfs_cache).
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=main:10m;
+
+    server {
+        location /content {
+            proxy_pass        http://backend;
+            proxy_cache       main;
+            proxy_cache_key   "$host$uri$is_args$args";
+            proxy_cache_purge PURGE purge_all from 127.0.0.1;
+        }
+    }
+}
+```
+
+```bash
+curl -X PURGE http://localhost/anything
+# 200 — entire cache zone cleared
+```
+
+### JSON responses with per-location override
+
+```nginx
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=main:10m;
+
+    cache_purge_background_queue on;
+
+    server {
+        cache_purge_response_type json;   # default for all locations in this server
+        location / {
+            proxy_pass        http://backend;
+            proxy_cache       main;
+            proxy_cache_key   "$host$uri$is_args$args";
+            proxy_cache_purge PURGE from all;
+        }
+
+        location /admin/purge {
+            # Override to plain text for scripting
+            cache_purge_response_type text;
+            proxy_cache_purge         main "$arg_key";
+        }
+    }
+}
+```
+
+### Vary-aware purge
+
+```nginx
+http {
+    cache_purge_vary_aware on;
+    gzip_vary              on;
+}
+```
+
+After purging a key, all gzip and Vary variants stored at different filesystem
+paths are also removed automatically.
+
+---
+
+## Performance tuning
+
+The appropriate values depend on storage type, cached file count, and purge
+request rate. The table below gives reasonable starting points.
+
+| Environment | `queue_size` | `batch_size` | `throttle_ms` |
+|---|---|---|---|
+| Small VPS — 1–2 cores, ≤ 2 GB RAM | 512 | 5 | 25ms |
+| Mid-range VDS — 4–8 cores, SSD | 2048 | 20 | 10ms |
+| Dedicated server — 16+ cores, NVMe | 8192 | 50 | 5ms |
+| High purge rate, any hardware | 8192 | 5 | 50ms |
+
+**Queue memory:** `queue_size × ~1.5 KB`. 2048 slots ≈ 3 MB of shared memory.
+
+**Throughput ceiling:** `batch_size ÷ throttle_ms_value × 1000` purges/sec, where
+`throttle_ms_value` is the numeric millisecond count (e.g. `10` for `10ms`). At
+defaults: `10 ÷ 10 × 1000 = 1 000/s`. On spinning disk or network storage,
+keep `batch_size` low and `throttle_ms` high to avoid iowait spikes.
+
+---
+
+## Monitoring and debugging
+
+Successful background purges return `202 Accepted`. The response body uses the
+format set by `cache_purge_response_type`.
+
+Relevant log messages:
+
+| Level   | Condition                          |
+|---------|------------------------------------|
+| `warn`  | Queue full; item timed out in queue |
+| `error` | Cache zone not found               |
+| `crit`  | File deletion failed               |
+
+```bash
+tail -f /var/log/nginx/error.log | grep "cache purge"
+```
+
+---
+
+## Troubleshooting
+
+**Purge requests block worker processes**
+Enable `cache_purge_background_queue on`.
+
+**Queue full warnings in the log**
+Increase `cache_purge_queue_size`, or reduce the purge request rate.
+
+**High iowait during purges**
+Decrease `cache_purge_batch_size` and increase `cache_purge_throttle_ms`.
+
+**Queue drains too slowly**
+Increase `cache_purge_batch_size` and decrease `cache_purge_throttle_ms`.
+
+**`412` responses where `404` is expected**
+Set `cache_purge_legacy_status off`.
+
+**Vary / gzip variants remain after purge**
+Enable `cache_purge_vary_aware on`.
+
+---
+
+## Testing
+
+The test suite uses [Test::Nginx](https://github.com/openresty/test-nginx).
+
+```bash
+prove -r t/
+```
+
+Individual suites:
+
+```bash
+prove t/basic.t
+prove t/background_queue.t
+prove t/config.t
+prove t/memory.t
+prove t/performance.t
+```
+
+See [`t/TESTING.md`](t/TESTING.md) for Docker-based testing and the full
+testing guide.
+
+---
+
+## Migration
+
+### From the original FRiCKLE module
+
+The module is backwards compatible. No configuration changes are required.
+To opt in to background processing, add:
+
+```nginx
+http {
+    cache_purge_background_queue on;
+}
+```
+
+### From nginx-selective-cache-purge-module
+
+Replace the module. Background queue functionality is now built in. Map your
+previous queue parameters to `cache_purge_queue_size`, `cache_purge_batch_size`,
+and `cache_purge_throttle_ms`.
+
+---
+
+## Security
+
+- Restrict purge endpoints with `allow` / `deny` directives or an upstream
+  authentication layer. Never expose them publicly.
+- Set `cache_purge_queue_size` to a value appropriate for your traffic to
+  limit shared memory consumption under request floods.
+- Consider pairing purge locations with `limit_req` to rate-limit purge
+  requests independently of normal traffic.
+
+---
+
+## License
+
+```
+Copyright (c) 2009-2014, FRiCKLE <info@frickle.com>
+Copyright (c) 2009-2014, Piotr Sikora <piotr.sikora@frickle.com>
+Copyright (C) 2016-2026, Denis Denisov
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+---
+
+## See also
+
+- [ngx_slowfs_cache](https://github.com/FRiCKLE/ngx_slowfs_cache)
+- [nginx-selective-cache-purge-module](https://github.com/wandenberg/nginx-selective-cache-purge-module)
+- [nginx documentation](https://nginx.org/en/docs/)
